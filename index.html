@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>3D Hand Tracker — Skeleton & Palm (MediaPipe + three.js)</title>
+<style>
+  :root{
+    --accent1:#ff77bf;
+    --accent2:#ff5aa3;
+    --bg:#000;
+    --ui-bg: rgba(0,0,0,0.45);
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Inter,system-ui,Arial}
+  #uiBar{
+    position:fixed;left:12px;right:12px;top:12px;z-index:40;
+    display:flex;gap:8px;align-items:center;padding:8px;border-radius:10px;background:var(--ui-bg);
+    box-shadow:0 8px 24px rgba(0,0,0,0.6);
+  }
+  button,select{background:linear-gradient(90deg,var(--accent1),var(--accent2));border:none;padding:8px 10px;border-radius:8px;color:#210214;font-weight:700;cursor:pointer}
+  .toggle{background:rgba(255,255,255,0.06);color:#ffd6f2;padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);cursor:pointer}
+  #status{margin-left:auto;color:#ffd6f2;font-size:13px}
+  #hint{position:fixed;right:12px;top:12px;color:#ffd6f2;background:rgba(255,90,163,0.06);padding:8px;border-radius:8px;z-index:40;font-size:13px}
+  /* three.js canvas will be full screen */
+  canvas { display:block; position:fixed; inset:0; z-index:10; }
+  video{display:none}
+  .small{font-size:13px;padding:6px 8px}
+</style>
+</head>
+<body>
+
+<div id="uiBar">
+  <button id="startBtn" class="small">Start (Rear)</button>
+  <button id="skeletonToggle" class="toggle small">Skeleton: ON</button>
+  <button id="palmToggle" class="toggle small">Palm: ON</button>
+
+  <label style="color:#ffd6f2;font-size:13px;margin-left:8px">Mode:</label>
+  <select id="modeSelect" class="small">
+    <option value="MID">MID (recommended)</option>
+    <option value="LOW">LOW (save battery)</option>
+    <option value="HIGH">HIGH (best quality)</option>
+  </select>
+
+  <div id="status">Status: idle</div>
+</div>
+
+<div id="hint">Tip: tahan tangan ~30–50cm dari kamera, pastikan area terang</div>
+
+<!-- hidden video to feed mediapipe -->
+<video id="video" playsinline autoplay muted></video>
+
+<!-- load external libs -->
+<script src="https://unpkg.com/three@0.154.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+<script>
+/*
+  3D Hand Tracker — Single-file
+  - Toggles: Skeleton & Palm
+  - Modes: LOW / MID / HIGH (affects resolution & modelComplexity)
+  - Uses getUserMedia (rear camera) + MediaPipe Hands + three.js
+  - Performance tuned for mobile (limits DPR, default MID settings)
+*/
+
+(() => {
+  // ---------- Elements ----------
+  const startBtn = document.getElementById('startBtn');
+  const skeletonToggle = document.getElementById('skeletonToggle');
+  const palmToggle = document.getElementById('palmToggle');
+  const modeSelect = document.getElementById('modeSelect');
+  const statusEl = document.getElementById('status');
+  const video = document.getElementById('video');
+
+  // ---------- Defaults / State ----------
+  let renderer, scene, camera, rafId;
+  let landmarkSpheres = [], boneCylinders = [], palmMesh = null;
+  let hands = null;
+  let running = false;
+  let processLoopId = null;
+  let modelOptions = { maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.6, minTrackingConfidence:0.6 };
+  let VIDEO_W = 640, VIDEO_H = 480;
+  let devicePixelRatioLimit = 1.4;
+  let smoothing = 0.6;
+  let skeletonOn = true, palmOn = true;
+
+  // connection pairs like MediaPipe HAND_CONNECTIONS
+  const CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [0,9],[9,10],[10,11],[11,12],
+    [0,13],[13,14],[14,15],[15,16],
+    [0,17],[17,18],[18,19],[19,20]
+  ];
+
+  // ---------- UI handlers ----------
+  skeletonToggle.addEventListener('click', ()=> {
+    skeletonOn = !skeletonOn;
+    skeletonToggle.textContent = `Skeleton: ${skeletonOn ? 'ON' : 'OFF'}`;
+    skeletonToggle.style.background = skeletonOn ? '' : 'rgba(255,255,255,0.06)';
+  });
+
+  palmToggle.addEventListener('click', ()=> {
+    palmOn = !palmOn;
+    palmToggle.textContent = `Palm: ${palmOn ? 'ON' : 'OFF'}`;
+    palmToggle.style.background = palmOn ? '' : 'rgba(255,255,255,0.06)';
+  });
+
+  modeSelect.addEventListener('change', async ()=>{
+    const mode = modeSelect.value;
+    applyMode(mode);
+    // if running, restart camera to apply new resolution/modelComplexity
+    if(running) {
+      await restartPipeline();
+    }
+  });
+
+  startBtn.addEventListener('click', async ()=>{
+    if(!running) {
+      await startPipeline();
+    } else {
+      stopPipeline();
+    }
+  });
+
+  // ---------- Mode presets ----------
+  function applyMode(mode){
+    // LOW / MID / HIGH presets
+    if(mode === 'LOW'){
+      VIDEO_W = 320; VIDEO_H = 240;
+      modelOptions.modelComplexity = 0;
+      devicePixelRatioLimit = 1.0;
+      smoothing = 0.7;
+    } else if(mode === 'HIGH'){
+      VIDEO_W = 960; VIDEO_H = 720;
+      modelOptions.modelComplexity = 1;
+      devicePixelRatioLimit = 1.8;
+      smoothing = 0.45;
+    } else { // MID
+      VIDEO_W = 640; VIDEO_H = 480;
+      modelOptions.modelComplexity = 1;
+      devicePixelRatioLimit = 1.4;
+      smoothing = 0.6;
+    }
+    statusEl.textContent = `Status: mode ${mode} applied`;
+  }
+  applyMode(modeSelect.value); // initial
+
+  // ---------- three.js init ----------
+  function initThree(){
+    // if already created, just resize
+    if(renderer){
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, devicePixelRatioLimit));
+      camera.aspect = window.innerWidth/window.innerHeight;
+      camera.updateProjectionMatrix();
+      return;
+    }
+
+    renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, devicePixelRatioLimit));
+    renderer.domElement.style.position = 'fixed';
+    renderer.domElement.style.inset = '0';
+    document.body.appendChild(renderer.domElement);
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 100);
+    camera.position.set(0,0,1.2);
+
+    const amb = new THREE.AmbientLight(0xffffff, 0.6); scene.add(amb);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.5); dir.position.set(0.5,0.8,1); scene.add(dir);
+
+    // spheres
+    const sphereGeo = new THREE.SphereGeometry(0.012, 10, 8);
+    const sphereMat = new THREE.MeshStandardMaterial({ color:0xff6fc7, emissive:0x220014, metalness:0.1, roughness:0.6 });
+    for(let i=0;i<21;i++){
+      const s = new THREE.Mesh(sphereGeo, sphereMat);
+      s.visible = false;
+      s.userData.pos = new THREE.Vector3();
+      scene.add(s); landmarkSpheres.push(s);
+    }
+
+    // bones
+    const cylMat = new THREE.MeshStandardMaterial({ color:0x66ffb3, emissive:0x022010, metalness:0.06, roughness:0.8 });
+    for(const [a,b] of CONNECTIONS){
+      const geo = new THREE.CylinderGeometry(0.0053,0.0053,1,8);
+      const m = new THREE.Mesh(geo, cylMat);
+      m.visible = false; m.userData.pos = new THREE.Vector3();
+      scene.add(m); boneCylinders.push({mesh:m,a,b});
+    }
+
+    // palm mesh (low-poly sphere)
+    const palmGeo = new THREE.SphereGeometry(0.06,8,6);
+    const palmMat = new THREE.MeshStandardMaterial({ color:0xff6fc7, transparent:true, opacity:0.12 });
+    palmMesh = new THREE.Mesh(palmGeo, palmMat); palmMesh.visible = false; palmMesh.userData.pos = new THREE.Vector3();
+    scene.add(palmMesh);
+
+    window.addEventListener('resize', ()=>{
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+  }
+
+  // mapping Mediapipe normal coords to three world coords
+  function landmarkToWorld(lm){
+    const scaleX = 1.0;
+    const scaleY = (window.innerHeight/window.innerWidth) * scaleX;
+    const depthScale = 1.0;
+    const x = (lm.x - 0.5) * scaleX * 1.6;
+    const y = -(lm.y - 0.5) * scaleY * 1.6;
+    const z = -lm.z * depthScale;
+    return new THREE.Vector3(x,y,z);
+  }
+  function smoothVec3(curr, target, t){
+    curr.lerp(target, 1 - Math.pow(1 - t, 2));
+  }
+
+  function updateFromLandmarks(landmarks){
+    if(!landmarks) return;
+    const world = landmarks.map(lm => landmarkToWorld(lm));
+    for(let i=0;i<21;i++){
+      const s = landmarkSpheres[i];
+      if(skeletonOn){
+        s.visible = true;
+        smoothVec3(s.userData.pos, world[i], smoothing);
+        s.position.copy(s.userData.pos);
+      } else s.visible = false;
+    }
+    // bones
+    for(let i=0;i<boneCylinders.length;i++){
+      const bc = boneCylinders[i];
+      const a = world[bc.a], b = world[bc.b];
+      const mesh = bc.mesh;
+      if(skeletonOn){
+        mesh.visible = true;
+        const mid = new THREE.Vector3().addVectors(a,b).multiplyScalar(0.5);
+        smoothVec3(mesh.userData.pos, mid, smoothing);
+        mesh.position.copy(mesh.userData.pos);
+        const diff = new THREE.Vector3().subVectors(a,b);
+        const len = Math.max(diff.length(), 0.0001);
+        mesh.scale.set(1, len, 1);
+        mesh.lookAt(a);
+        mesh.rotateX(Math.PI/2);
+      } else mesh.visible = false;
+    }
+    // palm
+    if(palmOn){
+      const wrist = world[0];
+      palmMesh.visible = true;
+      const target = wrist.clone().add(new THREE.Vector3(0,-0.02,-0.02));
+      smoothVec3(palmMesh.userData.pos, target, smoothing);
+      palmMesh.position.copy(palmMesh.userData.pos);
+    } else palmMesh.visible = false;
+  }
+
+  // ---------- MediaPipe init ----------
+  function initHands(){
+    if(hands) {
+      // update options if needed
+      hands.setOptions(modelOptions);
+      return;
+    }
+    hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions(modelOptions);
+    hands.onResults((results) => {
+      if(results && results.multiHandLandmarks && results.multiHandLandmarks.length>0){
+        updateFromLandmarks(results.multiHandLandmarks[0]);
+        statusEl.textContent = 'Status: hand detected';
+      } else {
+        landmarkSpheres.forEach(s=>s.visible=false);
+        boneCylinders.forEach(b=>b.mesh.visible=false);
+        palmMesh.visible=false;
+        statusEl.textContent = 'Status: no hand';
+      }
+    });
+  }
+
+  // ---------- camera + processing ----------
+  async function startCamera(){
+    // attempt exact rear, fallback to ideal
+    let constraints = {
+      audio:false,
+      video: { width: VIDEO_W, height: VIDEO_H, facingMode: { exact: 'environment' } }
+    };
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+      return stream;
+    } catch(e){
+      try {
+        constraints.video.facingMode = { ideal: 'environment' };
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        await video.play();
+        return stream;
+      } catch(e2){
+        throw e2;
+      }
+    }
+  }
+
+  // we will use an offscreen canvas to feed frames to MediaPipe at desired resolution
+  const offCanvas = document.createElement('canvas');
+  let offCtx=null;
+
+  async function processLoop(){
+    if(!video || video.readyState < 2) {
+      processLoopId = requestAnimationFrame(processLoop);
+      return;
+    }
+    if(!offCtx){
+      offCanvas.width = VIDEO_W; offCanvas.height = VIDEO_H;
+      offCtx = offCanvas.getContext('2d');
+    }
+    // draw video scaled to model input
+    offCtx.drawImage(video, 0, 0, offCanvas.width, offCanvas.height);
+    // send to mediapipe
+    try {
+      await hands.send({image: offCanvas});
+    } catch(err) {
+      // ignore send errors
+      console.warn('hands.send error', err);
+    }
+    processLoopId = requestAnimationFrame(processLoop);
+  }
+
+  // ---------- pipeline control ----------
+  async function startPipeline(){
+    statusEl.textContent = 'Status: initializing...';
+    initThree();
+    initHands();
+    try{
+      await startCamera();
+    }catch(err){
+      console.error('Camera failed', err);
+      alert('Gagal akses kamera. Pastikan situs di-HTTPS dan kamera diizinkan.');
+      statusEl.textContent = 'Status: camera error';
+      return;
+    }
+    // start processing and rendering
+    processLoop();
+    running = true;
+    startBtn.textContent = 'Stop';
+    statusEl.textContent = 'Status: running';
+    animate(); // three render loop
+  }
+
+  function stopPipeline(){
+    // stop camera tracks
+    if(video && video.srcObject){
+      const tracks = video.srcObject.getTracks();
+      tracks.forEach(t=>t.stop());
+      video.srcObject = null;
+    }
+    // cancel loops
+    if(processLoopId) cancelAnimationFrame(processLoopId);
+    if(rafId) cancelAnimationFrame(rafId);
+    running = false;
+    startBtn.textContent = 'Start (Rear)';
+    statusEl.textContent = 'Status: stopped';
+  }
+
+  async function restartPipeline(){
+    stopPipeline();
+    // recreate hands with new options
+    if(hands){
+      try { hands.close && hands.close(); } catch(e){}
+      hands = null;
+    }
+    await startPipeline();
+  }
+
+  // ---------- render loop ----------
+  function animate(){
+    rafId = requestAnimationFrame(animate);
+    renderer.render(scene, camera);
+  }
+
+  // ---------- init ----------
+  initThree();
+  initHands();
+
+  // auto attempt if permission already granted
+  (async ()=>{
+    try{
+      const p = await navigator.permissions.query({ name:'camera' });
+      if(p && p.state === 'granted'){
+        // do nothing auto-start; require user gesture for audio/camera in some browsers
+      }
+    }catch(e){}
+  })();
+
+})(); // IIFE end
+</script>
+</body>
+  </html>
